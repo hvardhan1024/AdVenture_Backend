@@ -6,7 +6,7 @@ const bcrypt = require("bcryptjs")
 const jwt = require("jsonwebtoken")
 const path = require("path")
 
-const { User, Video, Campaign, Match } = require("./models")
+const { User, Video, Campaign, Match, Chat, Message } = require("./models")
 const {
   authenticateToken,
   requireRole,
@@ -881,6 +881,252 @@ app.get(
   }
 )
 
+// ==================== AI CHAT SYSTEM ROUTES ====================
+
+// Format functions for chat system
+const formatChatData = (chat) => ({
+  id: chat._id,
+  title: chat.title,
+  marketerId: chat.marketerId,
+  isActive: chat.isActive,
+  createdAt: chat.createdAt,
+})
+
+const formatMessageData = (message) => ({
+  id: message._id,
+  chatId: message.chatId,
+  content: message.content,
+  sender: message.sender,
+  metadata: message.metadata,
+  createdAt: message.createdAt,
+})
+
+// Create new chat
+app.post(
+  "/api/chat/create",
+  authenticateToken,
+  requireRole("marketer"),
+  async (req, res) => {
+    try {
+      const { title } = req.body
+
+      if (!title) {
+        return res.status(400).json({
+          success: false,
+          message: "Chat title is required",
+        })
+      }
+
+      const chat = new Chat({
+        title,
+        marketerId: req.user._id,
+      })
+
+      await chat.save()
+      console.log("✅ Chat created successfully")
+
+      res.status(201).json({
+        success: true,
+        data: {
+          chat: formatChatData(chat),
+        },
+        message: "Chat created successfully",
+      })
+    } catch (error) {
+      console.log("❌ Chat creation failed:", error.message)
+      res.status(500).json({
+        success: false,
+        message: "Chat creation failed",
+      })
+    }
+  }
+)
+
+// Get marketer's chats
+app.get(
+  "/api/chat/my-chats",
+  authenticateToken,
+  requireRole("marketer"),
+  async (req, res) => {
+    try {
+      const chats = await Chat.find({ marketerId: req.user._id }).sort({
+        createdAt: -1,
+      })
+
+      console.log("✅ Chats retrieved successfully")
+
+      res.json({
+        success: true,
+        data: {
+          chats: chats.map(formatChatData),
+        },
+        message: "Chats retrieved successfully",
+      })
+    } catch (error) {
+      console.log("❌ Chats retrieval failed:", error.message)
+      res.status(500).json({
+        success: false,
+        message: "Chats retrieval failed",
+      })
+    }
+  }
+)
+
+// Get chat messages
+app.get(
+  "/api/chat/:chatId/messages",
+  authenticateToken,
+  requireRole("marketer"),
+  async (req, res) => {
+    try {
+      const { chatId } = req.params
+
+      // Verify chat belongs to the marketer
+      const chat = await Chat.findOne({ _id: chatId, marketerId: req.user._id })
+      if (!chat) {
+        return res.status(404).json({
+          success: false,
+          message: "Chat not found",
+        })
+      }
+
+      const messages = await Message.find({ chatId }).sort({ createdAt: 1 })
+
+      console.log("✅ Chat messages retrieved")
+
+      res.json({
+        success: true,
+        data: {
+          messages: messages.map(formatMessageData),
+        },
+        message: "Messages retrieved successfully",
+      })
+    } catch (error) {
+      console.log("❌ Messages retrieval failed:", error.message)
+      res.status(500).json({
+        success: false,
+        message: "Messages retrieval failed",
+      })
+    }
+  }
+)
+
+// Send message to chat
+app.post(
+  "/api/chat/:chatId/message",
+  authenticateToken,
+  requireRole("marketer"),
+  async (req, res) => {
+    try {
+      const { chatId } = req.params
+      const { content } = req.body
+
+      if (!content) {
+        return res.status(400).json({
+          success: false,
+          message: "Message content is required",
+        })
+      }
+
+      // Verify chat belongs to the marketer
+      const chat = await Chat.findOne({ _id: chatId, marketerId: req.user._id })
+      if (!chat) {
+        return res.status(404).json({
+          success: false,
+          message: "Chat not found",
+        })
+      }
+
+      // Save user message
+      const userMessage = new Message({
+        chatId,
+        content,
+        sender: "user",
+      })
+      await userMessage.save()
+
+      // Get data for AI context
+      const campaigns = await Campaign.find({
+        marketerId: req.user._id,
+      }).populate("marketerId", "name")
+
+      const videos = await Video.find().populate("creatorId", "name")
+
+      // Generate AI response
+      const aiResponse = await geminiService.processChatQuery(
+        content,
+        campaigns.map(formatCampaignData),
+        videos.map(formatVideoData)
+      )
+
+      // Save AI message
+      const aiMessage = new Message({
+        chatId,
+        content: aiResponse,
+        sender: "ai",
+      })
+      await aiMessage.save()
+
+      console.log("✅ Chat messages sent and AI response generated")
+
+      res.json({
+        success: true,
+        data: {
+          userMessage: formatMessageData(userMessage),
+          aiMessage: formatMessageData(aiMessage),
+        },
+        message: "Messages sent successfully",
+      })
+    } catch (error) {
+      console.log("❌ Message sending failed:", error.message)
+      res.status(500).json({
+        success: false,
+        message: "Message sending failed",
+      })
+    }
+  }
+)
+
+// Delete chat
+app.delete(
+  "/api/chat/:chatId",
+  authenticateToken,
+  requireRole("marketer"),
+  async (req, res) => {
+    try {
+      const { chatId } = req.params
+
+      // Verify chat belongs to the marketer
+      const chat = await Chat.findOne({ _id: chatId, marketerId: req.user._id })
+      if (!chat) {
+        return res.status(404).json({
+          success: false,
+          message: "Chat not found",
+        })
+      }
+
+      // Delete all messages in the chat
+      await Message.deleteMany({ chatId })
+
+      // Delete the chat
+      await Chat.findByIdAndDelete(chatId)
+
+      console.log("✅ Chat deleted successfully")
+
+      res.json({
+        success: true,
+        message: "Chat deleted successfully",
+      })
+    } catch (error) {
+      console.log("❌ Chat deletion failed:", error.message)
+      res.status(500).json({
+        success: false,
+        message: "Chat deletion failed",
+      })
+    }
+  }
+)
+
 // ==================== ERROR HANDLING ====================
 
 // 404 handler
@@ -914,4 +1160,5 @@ app.listen(PORT, () => {
       process.env.GEMINI_API_KEY ? "Configured" : "Not configured"
     }`
   )
+  console.log(`💬 AI Chat System: Enabled for marketers`)
 })
